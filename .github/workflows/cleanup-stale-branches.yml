@@ -1,0 +1,293 @@
+name: Cleanup Stale Branches
+
+on:
+  # Manual trigger with confirmation and configuration inputs
+  workflow_dispatch:
+    inputs:
+      confirm_deletion:
+        description: 'Type "DELETE" to confirm branch deletion'
+        required: true
+        type: string
+      days_stale:
+        description: 'Number of days a branch must be inactive to be considered stale'
+        required: true
+        type: number
+        default: 90
+      max_deletions:
+        description: 'Maximum number of branches to delete in this run'
+        required: true
+        type: number
+        default: 10
+      exclude_patterns:
+        description: 'Comma-separated patterns to exclude (e.g., main,master,develop,release/*,hotfix/*)'
+        required: false
+        type: string
+        default: 'main,master,develop,release/*,hotfix/*'
+      dry_run:
+        description: 'Dry run mode - only show what would be deleted without actually deleting'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  cleanup-stale-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all branches and history
+      
+      - name: Validate user confirmation
+        run: |
+          echo "::group::Validating User Confirmation"
+          if [ "${{ inputs.confirm_deletion }}" != "DELETE" ]; then
+            echo "❌ Deletion not confirmed. You must type 'DELETE' exactly to proceed."
+            echo "You entered: '${{ inputs.confirm_deletion }}'"
+            exit 1
+          fi
+          echo "✅ User confirmation validated"
+          echo "::endgroup::"
+      
+      - name: Display Configuration
+        run: |
+          echo "::group::Cleanup Configuration"
+          echo "📋 Configuration Settings:"
+          echo "  • Days Stale Threshold: ${{ inputs.days_stale }} days"
+          echo "  • Maximum Deletions: ${{ inputs.max_deletions }} branches"
+          echo "  • Exclude Patterns: ${{ inputs.exclude_patterns }}"
+          echo "  • Dry Run Mode: ${{ inputs.dry_run }}"
+          echo "  • Repository: ${{ github.repository }}"
+          echo "  • Triggered by: ${{ github.actor }}"
+          echo "::endgroup::"
+      
+      - name: Fetch all branches
+        run: |
+          echo "::group::Fetching Branch Information"
+          git fetch --all --prune
+          echo "✅ All branches fetched"
+          echo "::endgroup::"
+      
+      - name: Get protected branches
+        id: protected_branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::group::Identifying Protected Branches"
+          
+          # Get protected branches from GitHub API
+          PROTECTED_BRANCHES=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/branches?protected=true" \
+            --jq '.[].name' | tr '\n' ',' | sed 's/,$//')
+          
+          if [ -z "$PROTECTED_BRANCHES" ]; then
+            echo "ℹ️  No protected branches found via API"
+            PROTECTED_BRANCHES=""
+          else
+            echo "🔒 Protected branches: $PROTECTED_BRANCHES"
+          fi
+          
+          echo "protected=$PROTECTED_BRANCHES" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+      
+      - name: Get branches with open PRs
+        id: pr_branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::group::Identifying Branches with Open Pull Requests"
+          
+          # Get all branches that have open PRs
+          PR_BRANCHES=$(gh pr list --state open --json headRefName --jq '.[].headRefName' | tr '\n' ',' | sed 's/,$//')
+          
+          if [ -z "$PR_BRANCHES" ]; then
+            echo "ℹ️  No branches with open pull requests"
+            PR_BRANCHES=""
+          else
+            echo "🔀 Branches with open PRs: $PR_BRANCHES"
+          fi
+          
+          echo "branches=$PR_BRANCHES" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+      
+      - name: Identify and process stale branches
+        id: identify_stale
+        env:
+          DAYS_STALE: ${{ inputs.days_stale }}
+          MAX_DELETIONS: ${{ inputs.max_deletions }}
+          EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
+          PROTECTED_BRANCHES: ${{ steps.protected_branches.outputs.protected }}
+          PR_BRANCHES: ${{ steps.pr_branches.outputs.branches }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          echo "::group::Identifying Stale Branches"
+          
+          # Note: Using GNU date syntax - works on ubuntu-latest runner
+          CUTOFF_DATE=$(date -d "$DAYS_STALE days ago" +%s)
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          
+          echo "📅 Cutoff date: $(date -d "@$CUTOFF_DATE" "+%Y-%m-%d %H:%M:%S")"
+          echo "🌿 Current branch: $CURRENT_BRANCH"
+          echo ""
+          
+          # Convert comma-separated lists to arrays
+          IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDE_PATTERNS"
+          IFS=',' read -ra PROTECTED_ARRAY <<< "$PROTECTED_BRANCHES"
+          IFS=',' read -ra PR_ARRAY <<< "$PR_BRANCHES"
+          
+          DELETED_COUNT=0
+          SKIPPED_COUNT=0
+          STALE_BRANCHES=()
+          
+          echo "🔍 Analyzing branches..."
+          echo ""
+          
+          # Get all remote branches
+          for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | sed 's/origin\///'); do
+            # Skip HEAD
+            if [ "$branch" == "HEAD" ]; then
+              continue
+            fi
+            
+            # Skip current branch
+            if [ "$branch" == "$CURRENT_BRANCH" ]; then
+              echo "⏭️  Skipping current branch: $branch"
+              ((SKIPPED_COUNT++))
+              continue
+            fi
+            
+            # Check if branch is protected
+            IS_PROTECTED=false
+            for protected in "${PROTECTED_ARRAY[@]}"; do
+              if [ "$branch" == "$protected" ]; then
+                IS_PROTECTED=true
+                break
+              fi
+            done
+            
+            if [ "$IS_PROTECTED" == "true" ]; then
+              echo "🔒 Skipping protected branch: $branch"
+              ((SKIPPED_COUNT++))
+              continue
+            fi
+            
+            # Check if branch has an open PR
+            HAS_OPEN_PR=false
+            for pr_branch in "${PR_ARRAY[@]}"; do
+              if [ "$branch" == "$pr_branch" ]; then
+                HAS_OPEN_PR=true
+                break
+              fi
+            done
+            
+            if [ "$HAS_OPEN_PR" == "true" ]; then
+              echo "🔀 Skipping branch with open PR: $branch"
+              ((SKIPPED_COUNT++))
+              continue
+            fi
+            
+            # Check exclude patterns
+            EXCLUDED=false
+            for pattern in "${EXCLUDE_ARRAY[@]}"; do
+              # Remove whitespace
+              pattern=$(echo "$pattern" | xargs)
+              
+              # Handle glob patterns
+              if [[ "$pattern" == *"*"* ]]; then
+                # Convert glob to regex (replace * with .*)
+                pattern_regex="${pattern//\*/.*}"
+                if [[ "$branch" =~ ^${pattern_regex}$ ]]; then
+                  EXCLUDED=true
+                  break
+                fi
+              else
+                # Exact match
+                if [ "$branch" == "$pattern" ]; then
+                  EXCLUDED=true
+                  break
+                fi
+              fi
+            done
+            
+            if [ "$EXCLUDED" == "true" ]; then
+              echo "⛔ Skipping excluded pattern: $branch"
+              ((SKIPPED_COUNT++))
+              continue
+            fi
+            
+            # Check if branch is stale
+            LAST_COMMIT_DATE=$(git log -1 --format=%ct origin/$branch 2>/dev/null || echo "0")
+            
+            if [ "$LAST_COMMIT_DATE" -lt "$CUTOFF_DATE" ]; then
+              LAST_COMMIT_DATE_HUMAN=$(date -d "@$LAST_COMMIT_DATE" "+%Y-%m-%d %H:%M:%S")
+              DAYS_OLD=$(( ($(date +%s) - LAST_COMMIT_DATE) / 86400 ))
+              
+              # Check deletion limit
+              if [ "$DELETED_COUNT" -ge "$MAX_DELETIONS" ]; then
+                echo "⚠️  Deletion limit ($MAX_DELETIONS) reached. Stopping."
+                break
+              fi
+              
+              echo "🗑️  Stale branch found: $branch (last commit: $LAST_COMMIT_DATE_HUMAN, $DAYS_OLD days old)"
+              STALE_BRANCHES+=("$branch")
+              
+              if [ "$DRY_RUN" == "false" ]; then
+                echo "   ➜ Deleting branch: $branch"
+                git push origin --delete "$branch" 2>&1 || echo "   ⚠️  Failed to delete $branch"
+                ((DELETED_COUNT++))
+              else
+                echo "   ➜ [DRY RUN] Would delete: $branch"
+                ((DELETED_COUNT++))
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "::endgroup::"
+          
+          echo "::group::Summary"
+          echo "📊 Cleanup Summary:"
+          echo "  • Stale branches identified: ${#STALE_BRANCHES[@]}"
+          if [ "$DRY_RUN" == "true" ]; then
+            echo "  • Branches that would be deleted: $DELETED_COUNT"
+          else
+            echo "  • Branches deleted: $DELETED_COUNT"
+          fi
+          echo "  • Branches skipped: $SKIPPED_COUNT"
+          
+          if [ "$DRY_RUN" == "true" ]; then
+            echo "  • Mode: DRY RUN (no actual deletions)"
+          else
+            echo "  • Mode: LIVE (branches were deleted)"
+          fi
+          
+          echo ""
+          echo "Stale branches list:"
+          if [ ${#STALE_BRANCHES[@]} -eq 0 ]; then
+            echo "  ✅ No stale branches found"
+          else
+            for branch in "${STALE_BRANCHES[@]}"; do
+              echo "  • $branch"
+            done
+          fi
+          echo "::endgroup::"
+          
+          # Set outputs
+          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+      
+      - name: Final Summary
+        run: |
+          echo "::notice::Cleanup completed. Processed: ${{ steps.identify_stale.outputs.deleted_count }} branches, Skipped: ${{ steps.identify_stale.outputs.skipped_count }} branches"
+          
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "::warning::This was a DRY RUN. No branches were actually deleted. Set dry_run to false to delete branches."
+          else
+            echo "::notice::Branches were permanently deleted from the repository."
+          fi
