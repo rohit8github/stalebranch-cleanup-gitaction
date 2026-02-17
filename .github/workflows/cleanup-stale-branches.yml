@@ -148,17 +148,25 @@ jobs:
           echo "🔍 Analyzing branches..."
           echo ""
           
-          # Get all remote branches
-          for branch in $(git branch -r | grep '^  origin/' | sed 's#^  origin/##' | grep -v '^HEAD$'); do
-            # Skip HEAD
-            if [ "$branch" == "HEAD" ]; then
+          # Get all remote branches, excluding symbolic refs and HEAD
+          # Using while-read loop to avoid word-splitting issues
+          while IFS= read -r branch; do
+            # Skip if branch name is empty, HEAD, or origin
+            if [ -z "$branch" ] || [ "$branch" = "HEAD" ] || [ "$branch" = "origin" ]; then
+              continue
+            fi
+            
+            # Verify the branch actually exists on the remote
+            if ! git rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+              echo "⚠️  Skipping invalid reference: $branch"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
             # Skip current branch
             if [ "$branch" == "$CURRENT_BRANCH" ]; then
               echo "⏭️  Skipping current branch: $branch"
-              ((SKIPPED_COUNT++))
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
@@ -173,7 +181,7 @@ jobs:
             
             if [ "$IS_PROTECTED" == "true" ]; then
               echo "🔒 Skipping protected branch: $branch"
-              ((SKIPPED_COUNT++))
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
@@ -188,7 +196,7 @@ jobs:
             
             if [ "$HAS_OPEN_PR" == "true" ]; then
               echo "🔀 Skipping branch with open PR: $branch"
-              ((SKIPPED_COUNT++))
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
@@ -217,7 +225,7 @@ jobs:
             
             if [ "$EXCLUDED" == "true" ]; then
               echo "⛔ Skipping excluded pattern: $branch"
-              ((SKIPPED_COUNT++))
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
@@ -240,13 +248,13 @@ jobs:
               if [ "$DRY_RUN" == "false" ]; then
                 echo "   ➜ Deleting branch: $branch"
                 git push origin --delete "$branch" 2>&1 || echo "   ⚠️  Failed to delete $branch"
-                ((DELETED_COUNT++))
+                DELETED_COUNT=$((DELETED_COUNT + 1))
               else
                 echo "   ➜ [DRY RUN] Would delete: $branch"
-                ((DELETED_COUNT++))
+                DELETED_COUNT=$((DELETED_COUNT + 1))
               fi
             fi
-          done
+          done < <(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin/)
           
           echo ""
           echo "::endgroup::"
@@ -281,6 +289,9 @@ jobs:
           # Set outputs
           echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
           echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+          
+          # Ensure successful exit
+          exit 0
       
       - name: Final Summary
         run: |
